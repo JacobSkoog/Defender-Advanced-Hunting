@@ -1,0 +1,33 @@
+// RDP Shadow Registry Modification - Enabling Shadowing Without Consent
+// Detects modification of the Terminal Services Shadow registry value
+// to settings that allow session shadowing without user consent.
+//
+// Shadow registry value meanings:
+//   0 = No remote control allowed
+//   1 = Full control with user permission
+//   2 = Full control without user permission  <-- malicious
+//   3 = View only with user permission
+//   4 = View only without user permission     <-- malicious
+//
+// MITRE ATT&CK: T1563.002 - Remote Service Session Hijacking: RDP Hijacking
+DeviceRegistryEvents
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has "Terminal Services"
+| where RegistryValueName =~ "Shadow"
+| where RegistryValueData in ("2", "4")
+| extend ShadowSetting = case(
+    RegistryValueData == "2", "Full control without consent",
+    RegistryValueData == "4", "View only without consent",
+    "Unknown"
+)
+| project
+    Timestamp,
+    DeviceName,
+    ShadowSetting,
+    RegistryKey,
+    RegistryValueData,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessAccountName,
+    InitiatingProcessSHA256,
+    ReportId
