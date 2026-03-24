@@ -1,7 +1,0 @@
-CloudAppEvents
-| where RawEventData contains "DirSyncEnabled"
-| where tostring(RawEventData.ObjectId) matches regex @"[regex here :)]" and ActionType == "Update user."
-| mv-expand red = RawEventData.ModifiedProperties
-| where tostring(red.Name) == "DirSyncEnabled" and tostring(red.NewValue) contains "true"
-| extend accountupn = tostring(RawEventData.ObjectId)
-| project Timestamp, ReportId, AccountDisplayName, accountupn, red
