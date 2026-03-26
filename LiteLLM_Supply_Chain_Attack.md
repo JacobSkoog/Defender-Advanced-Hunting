@@ -1,4 +1,4 @@
-# LiteLLM Supply Chain Attack Detection (CVE Pending)
+# LiteLLM Supply Chain Attack Detection
 
 ## Overview
 
