@@ -3,7 +3,9 @@
 ## Overview
 
 Detects potential paste jacking attacks, most commonly delivered today through fake CAPTCHA or "verify you are human" pages. The attack flow works as follows: a user lands on a malicious or compromised site that presents a convincing CAPTCHA dialog. When the user clicks "Verify" or "I'm not a robot", JavaScript silently copies a malicious command to their clipboard. The page then instructs the user to press Win+R, paste with Ctrl+V, and hit Enter — framed as a "verification step". The user believes they are completing a CAPTCHA, but they are actually executing a malicious payload through the Windows Run dialog.
+
 This technique (also referred to as ClickFix) has become the most prevalent paste jacking variant, replacing older methods that relied on hidden clipboard replacement during copy operations. It is effective because it leverages social engineering to make the user perform the execution themselves, bypassing browser sandboxing and download protections entirely.
+
 Since the clipboard manipulation and social engineering happen within the browser, endpoint agents have no visibility into those stages. However, the resulting process creation — explorer.exe spawning a scripting engine with a long, suspicious command line — is fully observable and highly anomalous. Legitimate Run dialog usage almost exclusively consists of short, simple commands like launching applications (calc, notepad, regedit) or opening paths. The query also correlates with GetClipboardData events to identify cases where clipboard content was read shortly before execution, further strengthening the signal.
 
 ## MITRE ATT&CK
