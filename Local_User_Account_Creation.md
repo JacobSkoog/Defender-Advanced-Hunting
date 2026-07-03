@@ -76,7 +76,7 @@ DeviceEvents
 | extend HourOfDay = hourofday(LocalTime)
 | extend OutsideBusinessHours = HourOfDay < BusinessHoursStart or HourOfDay >= BusinessHoursEnd
 | extend DayOfWeek = dayofweek(LocalTime) / 1d
-| extend IsWeekend = DayOfWeek >= 5 // Saturday = 5, Sunday = 6
+| extend IsWeekend = DayOfWeek == 6 or DayOfWeek == 0 // Saturday = 6, Sunday = 0
 // Flag suspicious characteristics
 | extend SuspiciousIndicators = array_concat(
     iff(OutsideBusinessHours, dynamic(["OutsideBusinessHours"]), dynamic([])),
