@@ -1,0 +1,171 @@
+# Anomalous RDP Session Source
+
+## Overview
+
+Surfaces devices that initiate an RDP session for the first time within a rolling baseline period. The premise matches the WinRM version in [Anomalous WinRM Session Source](Anomalous_WinRM_Source_Device.md): look at where the session came from rather than where it landed, so that a compromised endpoint pivoting outward is visible even when the destination-side logon looks ordinary.
+
+RDP is the harder of the two. Outbound 3389 from client endpoints is common in most environments, and a first-time occurrence frequently means somebody changed teams, picked up a new responsibility, or was handed access to a server they had not touched before. Expect to spend more time tuning this one, and expect the steady state to be a handful of rows per run rather than zero.
+
+This is written as a hunting query, not a custom detection rule. See Why This Is a Hunt below.
+
+## MITRE ATT&CK
+
+| Tactic | Technique | ID |
+|---|---|---|
+| Lateral Movement | Remote Services: Remote Desktop Protocol | T1021.001 |
+| Discovery | Network Service Discovery | T1046 |
+| Discovery | Remote System Discovery | T1018 |
+
+## Data Sources
+
+- `DeviceNetworkEvents` — outbound connection telemetry from the initiating host
+- `DeviceInfo` — device maturity filter
+- `DeviceLogonEvents` — account maturity filter for the second query
+
+As with WinRM, only onboarded source devices are covered. A pivot from an unmanaged host does not appear here.
+
+## Detection Logic
+
+A 30 day window is split into a baseline period and a detection window, and devices present in the detection window but absent from the baseline are returned. Device maturity and private-destination filters apply as in the WinRM query.
+
+Two things differ from the WinRM version because of RDP's noise profile:
+
+**Connection attempts are included alongside successes.** RDP scanning and credential spraying produce large volumes of `ConnectionAttempt` and `ConnectionFailed` with few or no successes, and that pattern is more interesting than a single successful session. The queries therefore return `ActionType` and count failures separately rather than filtering to successes only. If you only care about established sessions, restrict to `ConnectionSuccess`.
+
+**Fan-out is the primary sort key.** A workstation that has never done RDP connecting to one server is weak signal. The same workstation touching fifteen hosts is strong signal regardless of baseline, and a fan-out threshold alone may be the more productive hunt in a large environment. `DistinctDestinations` and `FailedAttempts` are placed first in the sort for that reason.
+
+The second query keys the baseline on device plus account instead of device alone, which catches an account that has never initiated RDP from a host that routinely does.
+
+## Why This Is a Hunt
+
+The baseline fits inside a scheduled custom detection running at 24 hour frequency, since that cadence carries a 30 day lookback. It should still not be an alert rule:
+
+1. A 24 hour mean time to detect is too slow for lateral movement to be actionable as an alert. You would be paging on yesterday.
+2. RDP source anomaly needs human context to be meaningful. The difference between a promotion and a pivot is not in the telemetry, and an exclusion list cannot hold it.
+
+If you do deploy it as a rule, note that saving a new custom detection triggers an immediate 30 day historical scan, and that a run producing more than 200 matches only alerts on the first 150.
+
+## Customization
+
+| Variable | Purpose |
+|---|---|
+| `Lookback` | Total baseline period. 30 days is the Advanced Hunting maximum. |
+| `DetectionWindow` | How far back to look for new behaviour. |
+| `MaturityThreshold` | A device must have telemetry older than this to be eligible. |
+| `ExcludedDevices` | Jump hosts, admin workstations, management servers. Populate before first run. |
+| `FanOutFloor` | Optional. Set above 1 to suppress single-destination hits entirely. |
+
+Third party clients change what you see in `InitiatingProcessFileName`. Beyond `mstsc.exe`, expect connection managers such as mRemoteNG, Royal TS, and Remote Desktop Connection Manager, plus the Windows App client. Build the expected set from your own data rather than assuming.
+
+In environments with broad server access for developers or operations, scoping to a device group of standard user workstations is usually the difference between a readable result set and an unusable one.
+
+## Query
+
+### 1. First RDP initiation by device
+
+```kusto
+// =====================================================================
+// Anomalous RDP Session Source - device baseline
+// Baseline : 30 days, keyed on DeviceId
+// Window   : last 24 hours
+// Returns  : devices initiating RDP for the first time in the period
+// =====================================================================
+let Lookback = 30d;
+let DetectionWindow = 1d;
+let MaturityThreshold = 21d;
+let FanOutFloor = 1;                                     // CUSTOMIZE
+let ExcludedDevices = dynamic(["jump01", "adm-ws01"]);   // CUSTOMIZE
+let Sessions =
+    DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionAttempt", "ConnectionFailed")
+    | where RemotePort == 3389
+    | where RemoteIPType == "Private"
+    | where not(DeviceName has_any (ExcludedDevices));
+let MatureDevices =
+    DeviceInfo
+    | where Timestamp between (ago(Lookback) .. ago(MaturityThreshold))
+    | distinct DeviceId;
+let Baseline =
+    Sessions
+    | where Timestamp < ago(DetectionWindow)
+    | distinct DeviceId;
+Sessions
+| where Timestamp >= ago(DetectionWindow)
+| where DeviceId in (MatureDevices)
+| join kind=leftanti (Baseline) on DeviceId
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    DistinctDestinations = dcount(RemoteIP),
+    Established = countif(ActionType == "ConnectionSuccess"),
+    FailedAttempts = countif(ActionType != "ConnectionSuccess"),
+    Destinations = make_set(RemoteIP, 25),
+    InitiatingProcesses = make_set(InitiatingProcessFileName, 10),
+    Accounts = make_set(InitiatingProcessAccountName, 10)
+    by DeviceId, DeviceName
+| where DistinctDestinations >= FanOutFloor
+| order by DistinctDestinations desc, FailedAttempts desc, FirstSeen asc
+```
+
+### 2. First RDP initiation by account on a device
+
+```kusto
+// =====================================================================
+// Anomalous RDP Session Source - device + account baseline
+// Baseline : 30 days, keyed on DeviceId + InitiatingProcessAccountSid
+// Window   : last 24 hours
+// Returns  : account/host pairs initiating RDP for the first time
+// =====================================================================
+let Lookback = 30d;
+let DetectionWindow = 1d;
+let MaturityThreshold = 21d;
+let FanOutFloor = 1;                                     // CUSTOMIZE
+let ExcludedDevices = dynamic(["jump01", "adm-ws01"]);   // CUSTOMIZE
+let Sessions =
+    DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType in ("ConnectionSuccess", "ConnectionAttempt", "ConnectionFailed")
+    | where RemotePort == 3389
+    | where RemoteIPType == "Private"
+    | where not(DeviceName has_any (ExcludedDevices))
+    | where isnotempty(InitiatingProcessAccountSid)
+    | where InitiatingProcessAccountName !endswith "$"
+    | where InitiatingProcessAccountName !in~ ("system", "local service", "network service");
+let MatureDevices =
+    DeviceInfo
+    | where Timestamp between (ago(Lookback) .. ago(MaturityThreshold))
+    | distinct DeviceId;
+let MatureAccounts =
+    DeviceLogonEvents
+    | where Timestamp between (ago(Lookback) .. ago(MaturityThreshold))
+    | where isnotempty(AccountSid)
+    | distinct AccountSid;
+let Baseline =
+    Sessions
+    | where Timestamp < ago(DetectionWindow)
+    | distinct DeviceId, InitiatingProcessAccountSid;
+Sessions
+| where Timestamp >= ago(DetectionWindow)
+| where DeviceId in (MatureDevices)
+| where InitiatingProcessAccountSid in (MatureAccounts)
+| join kind=leftanti (Baseline) on DeviceId, InitiatingProcessAccountSid
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    DistinctDestinations = dcount(RemoteIP),
+    Established = countif(ActionType == "ConnectionSuccess"),
+    FailedAttempts = countif(ActionType != "ConnectionSuccess"),
+    Destinations = make_set(RemoteIP, 25),
+    InitiatingProcesses = make_set(InitiatingProcessFileName, 10)
+    by DeviceId, DeviceName, InitiatingProcessAccountUpn, InitiatingProcessAccountSid
+| where DistinctDestinations >= FanOutFloor
+| order by DistinctDestinations desc, FailedAttempts desc, FirstSeen asc
+```
+
+## Triage
+
+1. Read `DistinctDestinations` and `FailedAttempts` together. High destinations with few successes is scanning or spraying. One destination with one success is usually a role change.
+2. Check `InitiatingProcesses` against the set of RDP clients you actually deploy. An unexpected binary opening 3389 is worth more attention than an unexpected destination.
+3. Confirm on the destination side. `DeviceLogonEvents` with `LogonType == "RemoteInteractive"` and a matching `RemoteIP` tells you whether the session established and under which identity, which the source-side telemetry does not.
+4. Compare against the account's normal hours. RDP from a workstation outside the user's usual pattern is a stronger case than the baseline miss on its own.
