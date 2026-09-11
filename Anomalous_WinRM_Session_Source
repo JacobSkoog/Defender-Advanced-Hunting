@@ -1,0 +1,168 @@
+# Anomalous WinRM Session Source
+
+## Overview
+
+Surfaces devices that initiate a Windows Remote Management (WinRM / PowerShell Remoting) session for the first time within a rolling baseline period. Most lateral movement coverage sits on the destination side, watching for unusual logons arriving at a host. This query inverts that and looks at the origin: a workstation that has never spoken WinRM to anything and suddenly does is a meaningful signal, because outside of IT staff and management tooling the protocol is close to unused on client endpoints.
+
+WinRM is the better half of this pair. Interactive remoting from a standard workstation is genuinely rare, which keeps the result set small enough to read by hand. The RDP equivalent lives in [Anomalous RDP Session Source](Anomalous_RDP_Source_Device.md) and is considerably noisier.
+
+This is written as a hunting query, not a custom detection rule. See Why This Is a Hunt below before deploying it as an alert.
+
+## MITRE ATT&CK
+
+| Tactic | Technique | ID |
+|---|---|---|
+| Lateral Movement | Remote Services: Windows Remote Management | T1021.006 |
+| Execution | Command and Scripting Interpreter: PowerShell | T1059.001 |
+| Discovery | Network Service Discovery | T1046 |
+
+## Data Sources
+
+- `DeviceNetworkEvents` — outbound connection telemetry from the initiating host
+- `DeviceInfo` — device maturity filter, so newly onboarded machines do not fire by definition
+- `DeviceLogonEvents` — account maturity filter for the second query
+
+Both WinRM ports are covered: 5985 (HTTP) and 5986 (HTTPS). Note that `DeviceNetworkEvents` only records connections leaving an onboarded device. An attacker pivoting from an unmanaged host is invisible to this query by design.
+
+## Detection Logic
+
+The query splits a 30 day window into a baseline period and a detection window. Any device that appears in the detection window but not in the baseline is returned. Two guards keep the false positive rate manageable:
+
+**Device maturity.** A device must have been reporting telemetry before the maturity threshold to be eligible. Without this, every newly onboarded machine and every laptop returning from a long absence produces a hit on its first day of WinRM use, which is not interesting.
+
+**Private destinations only.** `RemoteIPType == "Private"` scopes this to internal movement. WinRM to a public address is a separate and arguably more urgent scenario, but it does not belong in a baseline query.
+
+The second query narrows the baseline key from device to device plus account. This catches the case where a host legitimately runs WinRM under one identity, for example a management agent under SYSTEM, but a user or service account that has never done so starts initiating sessions from it. It is the stronger of the two for detecting credential abuse on an admin workstation, and correspondingly noisier around role changes and onboarding.
+
+`DistinctDestinations` is worth reading first in the results. A single new destination is usually a person doing their job. Ten in an hour is enumeration.
+
+## Why This Is a Hunt
+
+A baseline comparison of this kind can technically run as a scheduled custom detection, since the 24 hour frequency carries a 30 day lookback and both periods fit inside one query. Two things argue against it:
+
+1. The 24 hour cadence gives you a 24 hour mean time to detect. For lateral movement that is too late to be an intervention, so the alert would only ever produce retrospective work.
+2. The result needs context an alert rule cannot carry. Whether a given host initiating WinRM is expected depends on who sits at it, what management tooling touches it, and whether someone changed teams last week. An analyst answers that in seconds. A rule needs it all encoded in an exclusion list that goes stale.
+
+If you deploy it as a rule anyway, be aware that saving a new custom detection triggers an immediate 30 day historical scan, and that any single run producing more than 200 matches only generates alerts for the first 150.
+
+## Customization
+
+| Variable | Purpose |
+|---|---|
+| `Lookback` | Total baseline period. 30 days is the maximum available in Advanced Hunting. |
+| `DetectionWindow` | How far back to look for new behaviour. Widen for a weekly hunt. |
+| `MaturityThreshold` | A device must have telemetry older than this to be eligible. |
+| `ExcludedDevices` | Jump hosts, admin workstations, and management servers. Populate this before first run. |
+
+Environments running SCCM, Intune remediation scripts, Ansible, PowerShell DSC, or agent-based monitoring will see WinRM from a much wider set of sources than expected. Run the query once with the baseline comparison removed to see what normal actually looks like before you tune. Scoping by device group is usually cleaner than maintaining a name list.
+
+## Query
+
+### 1. First WinRM initiation by device
+
+```kusto
+// =====================================================================
+// Anomalous WinRM Session Source - device baseline
+// Baseline : 30 days, keyed on DeviceId
+// Window   : last 24 hours
+// Returns  : devices initiating WinRM for the first time in the period
+// =====================================================================
+let Lookback = 30d;
+let DetectionWindow = 1d;
+let MaturityThreshold = 21d;
+let WinRMPorts = dynamic([5985, 5986]);
+let ExcludedDevices = dynamic(["jump01", "adm-ws01"]);   // CUSTOMIZE
+let Sessions =
+    DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType == "ConnectionSuccess"
+    | where RemotePort in (WinRMPorts)
+    | where RemoteIPType == "Private"
+    | where not(DeviceName has_any (ExcludedDevices));
+let MatureDevices =
+    DeviceInfo
+    | where Timestamp between (ago(Lookback) .. ago(MaturityThreshold))
+    | distinct DeviceId;
+let Baseline =
+    Sessions
+    | where Timestamp < ago(DetectionWindow)
+    | distinct DeviceId;
+Sessions
+| where Timestamp >= ago(DetectionWindow)
+| where DeviceId in (MatureDevices)
+| join kind=leftanti (Baseline) on DeviceId
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    SessionCount = count(),
+    DistinctDestinations = dcount(RemoteIP),
+    Destinations = make_set(RemoteIP, 25),
+    Ports = make_set(RemotePort),
+    InitiatingProcesses = make_set(InitiatingProcessFileName, 10),
+    Accounts = make_set(InitiatingProcessAccountName, 10)
+    by DeviceId, DeviceName
+| order by DistinctDestinations desc, FirstSeen asc
+```
+
+### 2. First WinRM initiation by account on a device
+
+```kusto
+// =====================================================================
+// Anomalous WinRM Session Source - device + account baseline
+// Baseline : 30 days, keyed on DeviceId + InitiatingProcessAccountSid
+// Window   : last 24 hours
+// Returns  : account/host pairs initiating WinRM for the first time
+// Note     : machine and built-in service accounts are excluded, they
+//            carry the bulk of legitimate management tooling traffic
+// =====================================================================
+let Lookback = 30d;
+let DetectionWindow = 1d;
+let MaturityThreshold = 21d;
+let WinRMPorts = dynamic([5985, 5986]);
+let ExcludedDevices = dynamic(["jump01", "adm-ws01"]);   // CUSTOMIZE
+let Sessions =
+    DeviceNetworkEvents
+    | where Timestamp > ago(Lookback)
+    | where ActionType == "ConnectionSuccess"
+    | where RemotePort in (WinRMPorts)
+    | where RemoteIPType == "Private"
+    | where not(DeviceName has_any (ExcludedDevices))
+    | where isnotempty(InitiatingProcessAccountSid)
+    | where InitiatingProcessAccountName !endswith "$"
+    | where InitiatingProcessAccountName !in~ ("system", "local service", "network service");
+let MatureDevices =
+    DeviceInfo
+    | where Timestamp between (ago(Lookback) .. ago(MaturityThreshold))
+    | distinct DeviceId;
+let MatureAccounts =
+    DeviceLogonEvents
+    | where Timestamp between (ago(Lookback) .. ago(MaturityThreshold))
+    | where isnotempty(AccountSid)
+    | distinct AccountSid;
+let Baseline =
+    Sessions
+    | where Timestamp < ago(DetectionWindow)
+    | distinct DeviceId, InitiatingProcessAccountSid;
+Sessions
+| where Timestamp >= ago(DetectionWindow)
+| where DeviceId in (MatureDevices)
+| where InitiatingProcessAccountSid in (MatureAccounts)
+| join kind=leftanti (Baseline) on DeviceId, InitiatingProcessAccountSid
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    SessionCount = count(),
+    DistinctDestinations = dcount(RemoteIP),
+    Destinations = make_set(RemoteIP, 25),
+    Ports = make_set(RemotePort),
+    InitiatingProcesses = make_set(InitiatingProcessFileName, 10)
+    by DeviceId, DeviceName, InitiatingProcessAccountUpn, InitiatingProcessAccountSid
+| order by DistinctDestinations desc, FirstSeen asc
+```
+
+## Triage
+
+1. Check `DistinctDestinations`. A wide fan-out from a client endpoint is enumeration or spraying, not admin work.
+2. Check `InitiatingProcesses`. `powershell.exe` and `pwsh.exe` are the expected initiators for interactive remoting. Anything else is worth a second look, particularly an unsigned or unusually located binary.
+3. Pivot to `DeviceProcessEvents` on the source around `FirstSeen` for the command line that opened the session, and to `DeviceLogonEvents` on the destination for what the session did once it landed.
+4. If the account is the anomaly rather than the device, check whether the same account appears on other hosts in the same window.
